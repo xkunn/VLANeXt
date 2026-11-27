@@ -21,6 +21,30 @@ VLANeXt Family builds directly on our ICML work, with the original VLANeXt servi
 
 [Models and configurations](#models-and-configurations) · [Environment setup](#environment-setup) · [Training](#training) · [Evaluation](#evaluation) · [Citation](#citation)
 
+## One-step MeanFlow on LIBERO-Long
+
+This fork fine-tunes the released VLANeXt-B-Long action head to generate eight actions in one call. Across 500 paired trials, MeanFlow completed one more episode than the released policy and reduced median observation-to-action-chunk latency by **45%**. [Training and evaluation instructions](#one-step-meanflow-action-policy)
+
+| Policy | Head calls per chunk | LIBERO-Long success | Median latency | 95th percentile latency |
+| --- | ---: | ---: | ---: | ---: |
+| Released VLANeXt-B-Long | 5 | 470/500 (94.0%) | 189 ms | 224 ms |
+| MeanFlow, 2,000 fine-tuning updates | 1 | 471/500 (94.2%) | 104 ms | 127 ms |
+
+![MeanFlow rollout showing the robot placing a bowl in the bottom drawer and closing it](imgs/meanflow-libero-long.gif)
+
+*Episode 151 from the evaluation above. The robot puts the bowl in the bottom drawer and closes it. Playback at 2× speed.*
+
+<details>
+<summary>Evaluation conditions and transfer results</summary>
+
+Both policies ran from the same 50 initial states per task across all 10 LIBERO-Long tasks (seed 42), executing eight actions before replanning. Both succeeded on 448 starts. MeanFlow alone succeeded on 23, the released policy alone succeeded on 22, and both failed on seven.
+
+Latency was measured separately on one NVIDIA H20 at batch size 1 with BF16 autocast. Each policy had 20 warmup calls followed by 100 timed calls. Timing starts with the raw observation and ends when the eight-action chunk is available. Simulator steps and rendering are excluded.
+
+In a separate LIBERO-90 transfer check, both policies scored 0/50 on stacking two bowls in a tray and 0/50 on placing a book in the front compartment of a caddy.
+
+</details>
+
 ## Changelog & News
 
 - **2026.09** 🚀 **VLANeXt Family paper is now available on [arXiv](https://arxiv.org/abs/2602.18532)!** Five new variants, **S, L, LAM, JEPA, and WAM**, extend the core recipe across model scales and emerging paradigms within one shared framework.
