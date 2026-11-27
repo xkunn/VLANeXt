@@ -208,13 +208,17 @@ class FinalLayer1D(nn.Module):
 # ----------------------------- Diffusion Policies ----------------------------
 # -----------------------------------------------------------------------------
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(self, hidden_size, frequency_embedding_size=256, condition_on_interval=False):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
+        self.interval_proj = None
+        if condition_on_interval:
+            self.interval_proj = nn.Linear(frequency_embedding_size, hidden_size, bias=False)
+            nn.init.zeros_(self.interval_proj.weight)
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
@@ -229,17 +233,21 @@ class TimestepEmbedder(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward(self, t):
+    def forward(self, t, interval=None):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_freq = t_freq.to(dtype=self.mlp[0].weight.dtype)
-        return self.mlp(t_freq)
+        embedding = self.mlp(t_freq)
+        if interval is not None:
+            features = self.timestep_embedding(interval, self.frequency_embedding_size)
+            embedding = embedding + self.interval_proj(features.to(t_freq.dtype))
+        return embedding
 
 
 class ActionDiffusionTransformerMetaquery(nn.Module):
-    def __init__(self, action_dim, condition_dim, hidden_size=384, depth=12, num_heads=6, mlp_ratio=4.0):
+    def __init__(self, action_dim, condition_dim, hidden_size=384, depth=12, num_heads=6, mlp_ratio=4.0, condition_on_interval=False):
         super().__init__()
         self.input_proj = nn.Linear(action_dim, hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size, condition_on_interval=condition_on_interval)
         self.cond_proj = nn.Linear(condition_dim, hidden_size)
         
         self.pos_embed = nn.Parameter(torch.zeros(1, 256, hidden_size))
@@ -264,7 +272,7 @@ class ActionDiffusionTransformerMetaquery(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, noisy_action, timestep, condition, history_actions=None):
+    def forward(self, noisy_action, timestep, condition, history_actions=None, interval=None):
         noisy_action = noisy_action.to(dtype=self.input_proj.weight.dtype)
         condition = condition.to(dtype=self.cond_proj.weight.dtype)
         
@@ -277,7 +285,7 @@ class ActionDiffusionTransformerMetaquery(nn.Module):
         x = self.input_proj(x_input) 
         x = x + self.pos_embed[:, :x.shape[1], :]
         
-        t = self.t_embedder(timestep) 
+        t = self.t_embedder(timestep, interval)
         c = self.cond_proj(condition) + t 
         
         for block in self.blocks:
@@ -304,11 +312,12 @@ class ActionDiffusionTransformerMoE(nn.Module):
         policy_pos_embed="absolute",
         rope_theta=10000.0,
         mrope_section=None,
+        condition_on_interval=False,
     ):
         super().__init__()
         self.policy_pos_embed = _normalize_policy_pos_embed(policy_pos_embed)
         self.input_proj = nn.Linear(action_dim, hidden_size)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size, condition_on_interval=condition_on_interval)
 
         self.pos_embed = (
             nn.Parameter(torch.zeros(1, 256, hidden_size))
@@ -357,6 +366,7 @@ class ActionDiffusionTransformerMoE(nn.Module):
         history_actions=None,
         gen_hidden_states=None,
         vlm_position_ids=None,
+        interval=None,
     ):
         _validate_rope_gen_states(self.policy_pos_embed, gen_hidden_states)
         noisy_action = noisy_action.to(dtype=self.input_proj.weight.dtype)
@@ -369,7 +379,7 @@ class ActionDiffusionTransformerMoE(nn.Module):
 
         x = self.input_proj(x_input)
         x = _maybe_add_abs_pos(x, self.pos_embed)
-        t = self.t_embedder(timestep)
+        t = self.t_embedder(timestep, interval)
         q_position_ids = None
         if self.policy_pos_embed == "rope":
             q_position_ids = _build_q_position_ids(x, vlm_position_ids)

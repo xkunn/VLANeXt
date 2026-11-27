@@ -1,4 +1,5 @@
 import os
+from functools import partial
 
 from PIL import Image
 import numpy as np
@@ -22,6 +23,7 @@ from src.models.modules.policies import (
     ActionClassificationTransformerMetaqueryAutoregressive,
     ActionClassificationTransformerMoEAutoregressive
 )
+from src.models.modules.mean_flow import mean_flow_loss, sample_mean_flow
 from src.models.modules.encoder import ActionTransformerProjector
 from src.models.modules.connector import ConnectorTransformer
 from src.models.modules.generator import DINOFeatureFlowGenerator, EmuTokenClassificationGenerator
@@ -138,6 +140,8 @@ class VLANeXt(nn.Module):
         wan_text_len=512,
         wan_tokenizer_model_id="google/umt5-xxl",
         future_video_downsample=1,
+        mean_flow_diagonal_fraction=0.5,
+        mean_flow_weight_power=0.0,
     ):
         super().__init__()
         
@@ -251,6 +255,17 @@ class VLANeXt(nn.Module):
                 f"Unknown classification_type: {self.classification_type}. "
                 "Options: 'parallel', 'autoregressive'."
             )
+        if scheduler_type == "mean_flow":
+            if loss_type != "diffusion" or diffusion_loss_domain != "noise":
+                raise ValueError("MeanFlow requires a diffusion head that predicts velocity.")
+            if dct_loss_weight:
+                raise ValueError("Set dct_loss_weight=0 for MeanFlow. Random intervals end at r, not at clean actions.")
+            if not 0 <= mean_flow_diagonal_fraction <= 1 or num_inference_timesteps < 1:
+                raise ValueError("MeanFlow requires diagonal_fraction in [0, 1] and positive inference steps.")
+            if not 0 <= mean_flow_weight_power <= 1:
+                raise ValueError("mean_flow_weight_power must be in [0, 1].")
+            self.mean_flow_weight_power = mean_flow_weight_power
+            self.mean_flow_diagonal_fraction = mean_flow_diagonal_fraction
         self.scheduler_type = scheduler_type
         self.diffusion_loss_domain = diffusion_loss_domain
         self.num_train_timesteps = num_train_timesteps
@@ -541,6 +556,7 @@ class VLANeXt(nn.Module):
             if condition_type in ["tight", "soft"]:
                 self.action_head = ActionDiffusionTransformerMoE(
                     action_dim=action_dim,
+                    condition_on_interval=scheduler_type == "mean_flow",
                     vlm_hidden_size=self.hidden_size,
                     hidden_size=policy_hidden_size,
                     depth=policy_depth,
@@ -552,6 +568,7 @@ class VLANeXt(nn.Module):
             elif condition_type == "loose":
                 self.action_head = ActionDiffusionTransformerMetaquery(
                     action_dim=action_dim,
+                    condition_on_interval=scheduler_type == "mean_flow",
                     condition_dim=self.hidden_size,
                     hidden_size=policy_hidden_size,
                     depth=policy_depth,
@@ -580,6 +597,8 @@ class VLANeXt(nn.Module):
                     clip_sample=False,
                     prediction_type=ddim_prediction_type
                 )
+            elif scheduler_type == "mean_flow":
+                self.noise_scheduler = None
             elif scheduler_type == "flow_match":
                 self.noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=num_train_timesteps)
             else:
@@ -1479,6 +1498,18 @@ class VLANeXt(nn.Module):
         )
 
     # forward for diffusion loss
+    def _conditioned_diffusion_head(self, connector_out, hidden_states, history, gen_hidden_states, position_ids):
+        if self.condition_type == "loose":
+            return partial(self.action_head, condition=connector_out.mean(dim=1), history_actions=history)
+        return partial(
+            self.action_head, vlm_hidden_states=hidden_states, history_actions=history,
+            gen_hidden_states=gen_hidden_states, vlm_position_ids=position_ids,
+        )
+
+    def _mean_flow_velocity(self, head, z, r, t):
+        scale = self.num_train_timesteps
+        return head(z, t * scale, interval=(t - r) * scale)
+
     def _forward_diffusion(self, input_ids, attention_mask, actions, proprioception, history_actions, proprio_attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw, mm_token_type_ids=None, token_type_ids=None, language_action_labels=None, future_images=None, future_videos=None, prompt_texts=None, current_images=None, return_loss_components=False):
         if self.model_family == "wan":
             return self._forward_video_generation_diffusion(
@@ -1505,41 +1536,34 @@ class VLANeXt(nn.Module):
             loss_img, gen_hidden_states = self._compute_future_image_loss_and_feats(future_images, hidden_states)
 
         if actions.ndim == 2: actions = actions.unsqueeze(1)
-        noise = torch.randn_like(actions)
-        B = actions.shape[0]
-        
-        if self.scheduler_type == "flow_match":
-            sigmas = torch.rand((B,), device=actions.device)
-            sigmas_expanded = sigmas.view(B, *([1] * (actions.ndim - 1)))
-            noisy_actions = (1.0 - sigmas_expanded) * actions + sigmas_expanded * noise
-            noisy_actions = noisy_actions.to(dtype=actions.dtype)
-            timesteps = sigmas * self.noise_scheduler.config.num_train_timesteps
-            target = actions if self.diffusion_loss_domain == "x0" else (noise - actions)
-        else:
-            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=actions.device).long()
-            noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
-            target = actions if self.diffusion_loss_domain == "x0" else noise
-            
-        policy_history = history_actions if self.use_action_input_policy else None
-
-        if self.condition_type in ["tight", "soft"]:
-            pred = self.action_head(
-                noisy_actions,
-                timesteps,
-                hidden_states,
-                history_actions=policy_history,
-                gen_hidden_states=gen_hidden_states,
-                vlm_position_ids=vlm_position_ids,
+        history = history_actions if self.use_action_input_policy else None
+        head = self._conditioned_diffusion_head(connector_out, hidden_states, history, gen_hidden_states, vlm_position_ids)
+        if self.scheduler_type == "mean_flow":
+            field = partial(self._mean_flow_velocity, head)
+            action_loss, flow_metrics = mean_flow_loss(
+                field, actions, self.mean_flow_diagonal_fraction, self.mean_flow_weight_power, return_metrics=True
             )
-        elif self.condition_type == "loose":
-            cond_input = connector_out.mean(dim=1)
-            pred = self.action_head(noisy_actions, timesteps, cond_input, history_actions=policy_history)
         else:
-             raise ValueError(f"Unknown condition type: {self.condition_type}")
-        
-        action_loss = F.mse_loss(pred, target)
+            noise = torch.randn_like(actions)
+            B = actions.shape[0]
+
+            if self.scheduler_type == "flow_match":
+                sigmas = torch.rand((B,), device=actions.device)
+                sigmas_expanded = sigmas.view(B, *([1] * (actions.ndim - 1)))
+                noisy_actions = (1.0 - sigmas_expanded) * actions + sigmas_expanded * noise
+                noisy_actions = noisy_actions.to(dtype=actions.dtype)
+                timesteps = sigmas * self.noise_scheduler.config.num_train_timesteps
+                target = actions if self.diffusion_loss_domain == "x0" else (noise - actions)
+            else:
+                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=actions.device).long()
+                noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
+                target = actions if self.diffusion_loss_domain == "x0" else noise
+            pred = head(noisy_actions, timesteps)
+            action_loss = F.mse_loss(pred, target)
         total_loss = action_loss
         loss_components = {"action": action_loss}
+        if self.scheduler_type == "mean_flow":
+            loss_components.update(flow_metrics)
         weighted_loss_components = {"action": action_loss}
 
         if self.dct_loss_weight > 0:
@@ -1905,23 +1929,16 @@ class VLANeXt(nn.Module):
 
         elif self.loss_type == "diffusion":
             action = torch.randn(B, self.num_actions, self.action_dim, device=input_ids.device).to(self.lmm.dtype)
+            head = self._conditioned_diffusion_head(connector_out, hidden_states, policy_history, gen_hidden_states, vlm_position_ids)
+            if self.scheduler_type == "mean_flow":
+                field = partial(self._mean_flow_velocity, head)
+                return pack_action(sample_mean_flow(field, action, self.num_inference_timesteps))
             self.noise_scheduler.set_timesteps(self.num_inference_timesteps)
             
             for t in self.noise_scheduler.timesteps:
                 timesteps = torch.full((B,), t, device=input_ids.device)
                 if self.scheduler_type != "flow_match": timesteps = timesteps.long()
-                if self.condition_type in ["tight", "soft"]:
-                    output = self.action_head(
-                        action,
-                        timesteps,
-                        hidden_states,
-                        history_actions=policy_history,
-                        gen_hidden_states=gen_hidden_states,
-                        vlm_position_ids=vlm_position_ids,
-                    )
-                else:
-                    cond_input = connector_out.mean(dim=1)
-                    output = self.action_head(action, timesteps, cond_input, history_actions=policy_history)
+                output = head(action, timesteps)
 
                 # FlowMatchEulerDiscreteScheduler only consumes velocity, so convert x0→velocity here.
                 # DDIM in x0 mode is handled by prediction_type="sample" at scheduler construction.

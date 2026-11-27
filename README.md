@@ -152,6 +152,19 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node=8 \
 
 `data.batch_size` is the total batch size across GPUs. Edit the YAML directly; `--config` selects a complete configuration file.
 
+### One-step MeanFlow action policy
+
+Fine-tune the released VLANeXt-B LIBERO-Long flow-matching policy to predict an eight-action chunk in one action-head call. The recipe freezes the backbone and trains the interval-conditioned head for 2,000 updates.
+
+Set the LIBERO TFDS root, Qwen3-VL backbone path, and released LIBERO-Long checkpoint in [the training configuration](config/libero_long_mean_flow.yaml). The data root should contain `libero_10/1.0.0`. Run training in the VLANeXt environment and evaluation in the LIBERO environment.
+
+```bash
+python -m scripts.train --config config/libero_long_mean_flow.yaml
+python -m scripts.libero_bench_eval --config config/libero_long_mean_flow_eval.yaml
+```
+
+The single-GPU configuration accumulates 32 microbatches of eight examples. For eight GPUs, set `train.distributed` to `true` and `train.gradient_accumulation_steps` to `4`, then launch the same training module with `torchrun --standalone --nproc_per_node=8`. Both settings give a global batch of 256. If you change the training output path, update `eval.finetuned_checkpoint` in [the evaluation configuration](config/libero_long_mean_flow_eval.yaml).
+
 ### Latent-Action Pretraining and Fine-Tuning
 
 VLANeXt-LAM uses a latent action model to derive supervision from visual transitions, then transfers the pretrained VLA to real robot actions.
