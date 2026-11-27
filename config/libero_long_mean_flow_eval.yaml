@@ -1,0 +1,20 @@
+data:
+  augmentation:
+    center_crop: true
+    center_crop_ratio: 0.9
+model:
+  diffusion_steps: 1
+  scheduler_type: mean_flow
+project:
+  use_wandb: false
+eval:
+  finetuned_checkpoint: ./outputs/libero-long-meanflow/checkpoint_final.pt
+  task_suite_name: libero_10
+  num_steps_wait: 10
+  num_steps_execute: 8
+  num_parallel_envs: 32
+  num_trials_per_task: 50
+  seed: 42
+  image_size: 256
+  resume_episodes: 0
+  resume_successes: 0

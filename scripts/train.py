@@ -1154,6 +1154,7 @@ def _run_training_loop(
     save_interval = config['project']['save_interval']
     use_wandb = config['project'].get('use_wandb', False)
     max_grad_norm = config['train'].get('max_grad_norm', 1.0)
+    check_flow_gradients = getattr(unwrapped, 'scheduler_type', None) == 'mean_flow'
     stage_start_time = time.time()
     last_log_time = stage_start_time
     last_log_step = start_step
@@ -1231,7 +1232,7 @@ def _run_training_loop(
         metric_count = 0
         return result
 
-    def log_training_progress(loss_value):
+    def log_training_progress(metrics):
         nonlocal last_log_time, last_log_step
         now = time.time()
         completed = step - start_step
@@ -1248,13 +1249,20 @@ def _run_training_loop(
             step,
             max_steps,
             progress,
-            loss_value,
+            metrics["loss"],
             lr_scheduler.get_last_lr()[0],
             format_duration(elapsed),
             avg_step_time,
             recent_step_time,
             format_duration(eta),
         )
+
+        if "loss_components/raw_mse" in metrics:
+            logger.info(
+                "MeanFlow step=%d raw_mse=%.5g correction_rms=%.5g velocity_rms=%.5g prediction_rms=%.5g",
+                step, metrics["loss_components/raw_mse"], metrics["loss_components/correction_rms"],
+                metrics["loss_components/velocity_rms"], metrics["loss_components/prediction_rms"],
+            )
 
     while step < max_steps:
         try:
@@ -1314,11 +1322,10 @@ def _run_training_loop(
                     reduce_across_ranks=is_log_step,
                     return_scalars=should_log,
                 )
-                loss_value = metrics.get("loss") if should_log else None
                 if progress_bar is not None:
                     progress_bar.update(1)
                 if should_log:
-                    log_training_progress(loss_value)
+                    log_training_progress(metrics)
                     if use_wandb:
                         wandb_payload = {f"{log_prefix}/{name}": value for name, value in metrics.items()}
                         wandb_payload.update({
@@ -1354,7 +1361,9 @@ def _run_training_loop(
 
             if do_update:
                 if max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm, error_if_nonfinite=check_flow_gradients
+                    )
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1365,11 +1374,13 @@ def _run_training_loop(
                     reduce_across_ranks=is_log_step,
                     return_scalars=should_log,
                 )
-                loss_value = metrics.get("loss") if should_log else None
                 if progress_bar is not None:
                     progress_bar.update(1)
                 if should_log:
-                    log_training_progress(loss_value)
+                    if check_flow_gradients and max_grad_norm > 0:
+                        metrics["grad_norm"] = grad_norm.item()
+                        logger.info("MeanFlow step=%d preclip_grad_norm=%.5g", step, metrics["grad_norm"])
+                    log_training_progress(metrics)
                     if use_wandb:
                         wandb_payload = {f"{log_prefix}/{name}": value for name, value in metrics.items()}
                         wandb_payload.update({
@@ -1554,6 +1565,9 @@ def train(config):
         )
 
     has_pretrained_ckpt = (pretrained_ckpt_path and os.path.exists(pretrained_ckpt_path))
+    mean_flow = config['model']['scheduler_type'] == 'mean_flow'
+    if mean_flow and pretrained_ckpt_path and not has_pretrained_ckpt:
+        raise FileNotFoundError(f"MeanFlow warm-start checkpoint not found: {pretrained_ckpt_path}")
     main_train_text_embedding = config['model'].get('train_text_embedding', None)
     main_train_vision_encoder = config['model'].get('train_vision_encoder', None)
     model = VLANeXt(
@@ -1569,6 +1583,8 @@ def train(config):
         num_train_timesteps=config['model'].get('num_train_timesteps', 1000),
         num_inference_timesteps=config['model'].get('num_inference_timesteps', 10),
         scheduler_type=config['model']['scheduler_type'],
+        mean_flow_diagonal_fraction=config['model'].get('mean_flow_diagonal_fraction', 0.5),
+        mean_flow_weight_power=config['model'].get('mean_flow_weight_power', 0.0),
         diffusion_loss_domain=config['model'].get('diffusion_loss_domain', 'noise'),
         condition_type=config['model'].get('condition_type', 'loose'),
         policy_hidden_size=config['model']['policy_hidden_size'],
@@ -1624,10 +1640,17 @@ def train(config):
     if has_pretrained_ckpt:
         if global_rank == 0:
             logger.info("Loading pretrained VLA checkpoint: %s", pretrained_ckpt_path)
-        state_dict, checkpoint_info = _load_model_state_dict_from_checkpoint(
-            pretrained_ckpt_path,
-            map_location=device,
-        )
+        if mean_flow and os.path.isfile(pretrained_ckpt_path):
+            # Share checkpoint pages across ranks and skip staging the released optimizer on every GPU.
+            checkpoint = torch.load(pretrained_ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+            state_dict = checkpoint["model_state_dict"]
+            checkpoint_info = {"type": "file"}
+            del checkpoint
+        else:
+            state_dict, checkpoint_info = _load_model_state_dict_from_checkpoint(
+                pretrained_ckpt_path,
+                map_location=device,
+            )
         state_dict = _strip_module_prefix(state_dict)
         if config['train'].get('pretrained_ignore_mismatched_shapes', False):
             state_dict, _ = _drop_mismatched_state_dict_entries(
@@ -1636,6 +1659,9 @@ def train(config):
                 logger=logger if global_rank == 0 else None,
             )
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        del state_dict
+        if mean_flow and (unexpected or set(missing) - {"action_head.t_embedder.interval_proj.weight"}):
+            raise ValueError(f"Incompatible MeanFlow warm start: missing={missing}, unexpected={unexpected}")
         if global_rank == 0:
             if checkpoint_info["type"] == "deepspeed":
                 logger.info(
@@ -1651,6 +1677,12 @@ def train(config):
                 logger.warning("Pretrained checkpoint path does not exist; training from scratch: %s", pretrained_ckpt_path)
             else:
                 logger.info("No pretrained checkpoint provided; training from scratch")
+
+    if config['train'].get('action_head_only', False):
+        if config['train'].get('train_alignment', {}).get('enabled', False):
+            raise ValueError("action_head_only and alignment training select conflicting parameter sets.")
+        model.requires_grad_(False)
+        model.action_head.requires_grad_(True)
 
     if use_deepspeed:
         model_unwrapped = model
@@ -1677,6 +1709,9 @@ def train(config):
     # -----------------------------------------------------------------------------
     # -------------------------------- Data Loader --------------------------------
     # -----------------------------------------------------------------------------
+    if mean_flow and world_size > 1:
+        # Initialize weights identically, then draw independent flow times/noise on each rank.
+        set_seed(seed + global_rank)
     data_root = config['data']['data_root']
     if dataset_name == "real":
         task_suite = config['data']['task_suite_name']

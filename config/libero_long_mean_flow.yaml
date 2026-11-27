@@ -1,0 +1,68 @@
+project:
+  name: libero-long-meanflow
+  output_dir: ./outputs
+  save_interval: 500
+  log_interval: 10
+  use_wandb: false
+data:
+  dataset_name: libero
+  dataset_format: tfds
+  data_root: ./datasets
+  task_suite_name: libero_10
+  input_modality: image
+  view_mode: multi
+  history_len: 8
+  future_len: 8
+  full_sequence: true
+  batch_size: 256
+  max_steps: 2000
+  num_workers: 1
+  buffer_size: 256
+  augmentation:
+    enabled: true
+    augment_order: [random_resized_crop, random_brightness, random_contrast, random_saturation, random_hue]
+    random_resized_crop:
+      scale: [0.8, 1.0]
+      ratio: [0.9, 1.1]
+    random_brightness: [0.2]
+    random_contrast: [0.8, 1.2]
+    random_saturation: [0.8, 1.2]
+    random_hue: [0.05]
+model:
+  lmm_path: ./checkpoints/Qwen3-VL-2B-Instruct
+  backbone_mode: frozen
+  gradient_checkpointing: false
+  use_proprio_input_vlm: true
+  use_action_input_policy: false
+  use_transformer_proprio_projector: false
+  use_transformer_connector: true
+  projector_depth: 2
+  projector_num_heads: 4
+  connector_depth: 2
+  connector_num_heads: 4
+  condition_type: soft
+  action_dim: 7
+  num_queries: 16
+  policy_depth: 29
+  policy_hidden_size: 1024
+  policy_num_heads: 16
+  policy_mlp_ratio: 4.0
+  loss_type: diffusion
+  scheduler_type: mean_flow
+  diffusion_loss_domain: noise
+  num_train_timesteps: 1000
+  num_inference_timesteps: 1
+  mean_flow_diagonal_fraction: 0.5
+  mean_flow_weight_power: 0.5
+  dct_loss_weight: 0.0
+train:
+  pretrained_checkpoint: ./checkpoints/VLANeXt-B-Long/VLANeXt_libero_10.pt
+  action_head_only: true
+  distributed: false
+  device: cuda
+  gradient_accumulation_steps: 32  # 8 examples per microbatch x 32 = 256 per update
+  learning_rate: 0.000002
+  warmup_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 2026

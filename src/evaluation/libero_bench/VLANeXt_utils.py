@@ -89,6 +89,9 @@ def get_vla(cfg):
     if hasattr(cfg, "model"):
         scheduler_type = getattr(cfg.model, "scheduler_type", scheduler_type)
 
+    if "mean_flow" in (scheduler_type, model_config['scheduler_type']) and scheduler_type != model_config['scheduler_type']:
+        raise ValueError("Set eval model.scheduler_type to the checkpoint's scheduler_type for MeanFlow.")
+
     use_action_input_policy = model_config.get('use_action_input_policy', False)
     use_transformer_proprio_projector = model_config.get('use_transformer_proprio_projector', False)
 
@@ -163,6 +166,8 @@ def get_vla(cfg):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if scheduler_type == "mean_flow" and (missing_keys or unexpected_keys):
+        raise ValueError(f"Incompatible MeanFlow evaluation checkpoint: missing={missing_keys}, unexpected={unexpected_keys}")
     print(f"Loaded state dict. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
